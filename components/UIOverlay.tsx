@@ -17,6 +17,7 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({ mode, onToggle, onPhotosUp
   const [shareLink, setShareLink] = useState<string>('');
   const [shareError, setShareError] = useState<string>('');
   const [copied, setCopied] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string>('');
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -51,6 +52,18 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({ mode, onToggle, onPhotosUp
     fileInputRef.current?.click();
   };
 
+  // Helper function to convert base64 to Blob
+  const base64ToBlob = (base64: string): Blob => {
+    const byteString = atob(base64.split(',')[1]);
+    const mimeString = base64.split(',')[0].split(':')[1].split(';')[0];
+    const ab = new ArrayBuffer(byteString.length);
+    const ia = new Uint8Array(ab);
+    for (let i = 0; i < byteString.length; i++) {
+      ia[i] = byteString.charCodeAt(i);
+    }
+    return new Blob([ab], { type: mimeString });
+  };
+
   const handleShare = async () => {
     if (!uploadedPhotos || uploadedPhotos.length === 0) {
       setShareError('请先上传照片');
@@ -60,21 +73,23 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({ mode, onToggle, onPhotosUp
     setIsSharing(true);
     setShareError('');
     setShareLink('');
+    setUploadProgress('准备上传...');
 
     try {
-      // Try API first (works in vercel dev and production)
-      const response = await fetch('/api/upload', {
+      // Step 1: Get presigned upload URLs from server
+      setUploadProgress('获取上传地址...');
+      const urlsResponse = await fetch('/api/get-upload-urls', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          images: uploadedPhotos,
+          imageCount: uploadedPhotos.length,
         }),
       });
 
       // If API returns 404, use localStorage fallback
-      if (response.status === 404) {
+      if (urlsResponse.status === 404) {
         const isLocalDev = window.location.hostname === 'localhost' || window.location.hostname.includes('127.0.0.1');
         
         if (isLocalDev) {
@@ -98,13 +113,61 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({ mode, onToggle, onPhotosUp
         }
       }
 
-      const data = await response.json();
+      const urlsData = await urlsResponse.json();
 
-      if (!response.ok) {
-        throw new Error(data.error || '分享失败');
+      if (!urlsResponse.ok) {
+        throw new Error(urlsData.error || '获取上传地址失败');
       }
 
-      setShareLink(data.shareLink);
+      const { shareId, uploadUrls } = urlsData;
+
+      // Step 2: Upload images directly to R2 using presigned URLs
+      setUploadProgress(`上传照片中 (0/${uploadedPhotos.length})...`);
+      
+      let uploadedCount = 0;
+      const uploadPromises = uploadedPhotos.map(async (photo, index) => {
+        const blob = base64ToBlob(photo);
+        const { uploadUrl, publicUrl } = uploadUrls[index];
+
+        const uploadResponse = await fetch(uploadUrl, {
+          method: 'PUT',
+          body: blob,
+          headers: {
+            'Content-Type': 'image/jpeg',
+          },
+        });
+
+        if (!uploadResponse.ok) {
+          throw new Error(`上传第 ${index + 1} 张图片失败`);
+        }
+
+        uploadedCount++;
+        setUploadProgress(`上传照片中 (${uploadedCount}/${uploadedPhotos.length})...`);
+        return publicUrl;
+      });
+
+      const imageUrls = await Promise.all(uploadPromises);
+
+      // Step 3: Complete the upload by storing metadata in KV
+      setUploadProgress('生成分享链接...');
+      const completeResponse = await fetch('/api/complete-upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          shareId,
+          imageUrls,
+        }),
+      });
+
+      const completeData = await completeResponse.json();
+
+      if (!completeResponse.ok) {
+        throw new Error(completeData.error || '保存分享信息失败');
+      }
+
+      setShareLink(completeData.shareLink);
     } catch (error: any) {
       console.error('Share error:', error);
       
@@ -132,6 +195,7 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({ mode, onToggle, onPhotosUp
       setShareError(error.message || '分享失败，请重试');
     } finally {
       setIsSharing(false);
+      setUploadProgress('');
     }
   };
 
@@ -211,7 +275,7 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({ mode, onToggle, onPhotosUp
                   className="group px-6 py-3 border-2 border-[#D4AF37] bg-black/70 backdrop-blur-md overflow-hidden transition-all duration-500 hover:shadow-[0_0_30px_#D4AF37] hover:border-[#fff] hover:bg-[#D4AF37]/20 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <span className="relative z-10 font-serif text-base md:text-lg text-[#D4AF37] tracking-[0.1em] group-hover:text-white transition-colors whitespace-nowrap">
-                    {isSharing ? '生成中...' : '生成分享链接'}
+                    {uploadProgress || (isSharing ? '生成中...' : '生成分享链接')}
                   </span>
                 </button>
                 {shareError && (
